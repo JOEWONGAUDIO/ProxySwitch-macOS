@@ -2,7 +2,7 @@
   <img src="assets/images/proxy_switch_logo.png" width="96" alt="Proxy Switch logo">
 </p>
 
-# Proxy Switch for macOS
+<h1 align="center">Proxy Switch for macOS</h1>
 
 Proxy Switch changes your Mac’s system proxy from the main window or menu bar. Save frequently used servers as profiles and switch between them with a click.
 
