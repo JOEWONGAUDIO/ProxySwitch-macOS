@@ -119,20 +119,65 @@ struct Failure: LocalizedError {
     var errorDescription: String? { message }
 }
 enum Network {
-    static func run(_ executable: String, _ args: [String]) throws -> String {
+    static func run(_ executable: String, _ args: [String], sensitive: Bool = false) throws -> String {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
+        var environment = ProcessInfo.processInfo.environment
+        environment["LC_ALL"] = "C"
+        process.environment = environment
         process.arguments = args
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = pipe
         try process.run()
         let output = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        let message = String(decoding: output, as: UTF8.self)
         guard process.terminationStatus == 0 else {
-            throw Failure(message: tr("网络命令失败") + ": \(args.first ?? executable) (\(process.terminationStatus))")
+            let service = args.count > 1 ? " [\(args[1])]" : ""
+            let detail = sensitive ? "" : String(message.trimmingCharacters(in: .whitespacesAndNewlines).prefix(600))
+            throw Failure(message: tr("网络命令失败") + ": \(args.first ?? executable)\(service) (\(process.terminationStatus))"
+                + (detail.isEmpty ? "" : "\n" + detail))
         }
-        return String(decoding: output, as: UTF8.self)
+        return message
+    }
+
+    static func endpointArguments(_ profile: Profile, command: String, service: String) throws -> [String] {
+        let host = profile.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        var address = in_addr()
+        guard inet_pton(AF_INET, host, &address) == 1, (1...65535).contains(profile.port) else {
+            throw Failure(message: tr("请检查 IPv4 地址、端口、协议及账号。"))
+        }
+
+        var arguments = [command, service, host, String(profile.port)]
+        if profile.authenticationEnabled == true {
+            guard let username = profile.username, !username.isEmpty else {
+                throw Failure(message: tr("请检查 IPv4 地址、端口、协议及账号。"))
+            }
+            arguments += ["on", username, profile.password ?? ""]
+        }
+        return arguments
+    }
+
+    static func commandServiceName(displayName: String, device: String?, order: String) -> String? {
+        let lines = order.split(whereSeparator: \.isNewline).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        let servicePattern = #/^\([0-9]+\)\s+(.+)$/#
+        let devicePattern = #/,\s*Device:\s*([^\s,)]+)/#
+        var services: [(name: String, device: String?)] = []
+        for (index, line) in lines.enumerated() {
+            guard let match = line.wholeMatch(of: servicePattern) else { continue }
+            let next = lines.dropFirst(index + 1).first ?? ""
+            let interface = next.firstMatch(of: devicePattern).map { String($0.1) }
+            services.append((String(match.1), interface))
+        }
+        if services.contains(where: { $0.name == displayName && (device == nil || $0.device == device) }) {
+            return displayName
+        }
+        guard let device else { return nil }
+        let matching = services.filter { $0.device == device }
+        return matching.count == 1 ? matching[0].name : nil
     }
 
     static func apply(_ profile: Profile?) throws {
@@ -143,22 +188,53 @@ enum Network {
               let id = global["PrimaryService"] as? String,
               let preferences = SCPreferencesCreate(nil, "Proxy Switch" as CFString, nil),
               let service = SCNetworkServiceCopy(preferences, id as CFString),
-              let name = SCNetworkServiceGetName(service) as String? else {
+              let displayName = SCNetworkServiceGetName(service) as String? else {
             throw Failure(message: tr("找不到当前联网的网络服务。"))
         }
-        for mode in ["-setautoproxystate", "-setproxyautodiscovery"] {
-            _ = try run(executable, [mode, name, "off"])
+        let device = SCNetworkServiceGetInterface(service).flatMap {
+            SCNetworkInterfaceGetBSDName($0) as String?
+        } ?? global["PrimaryInterface"] as? String
+        let order = try run(executable, ["-listnetworkserviceorder"])
+        guard let name = commandServiceName(displayName: displayName, device: device, order: order) else {
+            throw Failure(message: tr("找不到当前联网的网络服务。") + " [\(displayName)]")
         }
+        let endpoints = try profile.map { profile in
+            try profile.protocols.filter { $0.2 }.map { _, key, _ in
+                (key, try endpointArguments(profile, command: "-set" + key, service: name))
+            }
+        } ?? []
+        func isOff(_ key: String) -> Bool {
+            SCPreferencesSynchronize(preferences)
+            guard let current = SCNetworkServiceCopy(preferences, id as CFString),
+                  let proxies = SCNetworkServiceCopyProtocol(current, kSCNetworkProtocolTypeProxies)
+            else { return false }
+            guard let configuration = SCNetworkProtocolGetConfiguration(proxies) as? [String: Any] else {
+                return false
+            }
+            guard let value = configuration[key] else { return true }
+            return (value as? NSNumber)?.intValue == 0
+        }
+
+        func turnOff(_ command: String, key: String) throws {
+            if isOff(key) { return }
+            do {
+                _ = try run(executable, [command, name, "off"])
+            } catch {
+                guard isOff(key) else { throw error }
+            }
+        }
+
+        try turnOff("-setautoproxystate", key: "ProxyAutoConfigEnable")
+        try turnOff("-setproxyautodiscovery", key: "ProxyAutoDiscoveryEnable")
         for mode in ["-setftpproxystate", "-setgopherproxystate", "-setstreamingproxystate"] {
             _ = try? run(executable, [mode, name, "off"])
         }
-        for (_, key, enabled) in (profile ?? Profile()).protocols {
-            if let profile, enabled {
-                let auth = profile.authenticationEnabled == true
-                    ? ["on", profile.username ?? "", profile.password ?? ""] : ["off"]
-                _ = try run(executable, ["-set" + key, name, profile.host, String(profile.port)] + auth)
-            }
-            _ = try run(executable, ["-set" + key + "state", name, profile != nil && enabled ? "on" : "off"])
+        for (key, arguments) in endpoints {
+            _ = try run(executable, arguments, sensitive: profile?.authenticationEnabled == true)
+            _ = try run(executable, ["-set" + key + "state", name, "on"])
+        }
+        for (label, key, enabled) in (profile ?? Profile()).protocols where profile == nil || !enabled {
+            try turnOff("-set" + key + "state", key: label + "Enable")
         }
     }
 }
