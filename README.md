@@ -8,7 +8,7 @@ Proxy Switch changes your Mac’s system proxy from the main window or menu bar.
 
 ![Proxy Switch for macOS, showing the proxy profile list](docs/screenshots/macos.png)
 
-*Captured on macOS 15 with example profiles.*
+*Captured on macOS 26.7.3 with example profiles and the desktop wallpaper visible through the window.*
 
 ## Features
 
